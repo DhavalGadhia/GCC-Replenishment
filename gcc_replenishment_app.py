@@ -1,5 +1,5 @@
 """
-GCC Replenishment Engine - Next-Gen Elite Command Center
+GCC Replenishment Engine
 =========================================================
 Advanced Streamlit application featuring heavy Apache ECharts live animations,
 glassmorphic UI, pulsing glow effects, and automated Oracle allocation pipelines.
