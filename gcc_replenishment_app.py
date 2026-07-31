@@ -299,7 +299,7 @@ if "final_df" not in st.session_state:
     st.session_state.detail_df = None
 
 # Step 1: Data Ingestion
-st.markdown("### 📥 Phase 1: Data Ingestion & Pipeline Upload")
+st.markdown("### 📥 Data Ingestion & Pipeline Upload")
 uploaded_files = st.file_uploader("Upload pipeline and inventory reports (.xlsx)", type=["xlsx", "xls"], accept_multiple_files=True)
 
 if uploaded_files:
@@ -333,7 +333,7 @@ if st.session_state.final_df is not None:
     # Phase 2 Header with Download Option Added
     p2_col1, p2_col2 = st.columns([3, 1])
     with p2_col1:
-        st.markdown("### 📊 Phase 2: Live Executive Analytics & KPIs")
+        st.markdown("### 📊 Live Executive Analytics & KPIs")
     with p2_col2:
         chart_summary = final_df.groupby("TO LOCATION")["QUANTITY"].sum().reset_index()
         sku_summary = final_df.groupby("ITEM")["QUANTITY"].sum().head(10).reset_index()
