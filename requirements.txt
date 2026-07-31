@@ -1,6 +1,0 @@
-streamlit
-pandas
-openpyxl
-streamlit-echarts
-streamlit-shadcn-ui
-altair
