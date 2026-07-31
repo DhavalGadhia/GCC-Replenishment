@@ -1,8 +1,0 @@
-streamlit
-pandas
-openpyxl
-altair
-streamlit-echarts
-
-# streamlit-shadcn-ui is not used by the current app (the KPI cards are
-# custom CSS). Add it back here if you start using it later.
