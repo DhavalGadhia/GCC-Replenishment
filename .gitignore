@@ -1,0 +1,11 @@
+# NEVER commit company data to the repo - the repo is not the place for it.
+*.xlsx
+*.xls
+*.csv
+sample/
+REAL_*
+.streamlit/secrets.toml
+.auth/
+users.json
+__pycache__/
+*.pyc
