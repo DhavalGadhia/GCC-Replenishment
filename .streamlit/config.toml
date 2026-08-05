@@ -1,0 +1,21 @@
+[theme]
+base = "light"
+primaryColor = "#2F6FED"
+backgroundColor = "#F5F7FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#131B33"
+
+[client]
+# Hides the developer options (Rerun, Clear cache, Deploy, and the
+# "view source" affordances) from everyone using the app.
+toolbarMode = "viewer"
+# Never surface Python tracebacks to end users - the app already catches
+# errors and shows a readable message instead.
+showErrorDetails = "none"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# The five extracts together can exceed the 200 MB default.
+maxUploadSize = 400
