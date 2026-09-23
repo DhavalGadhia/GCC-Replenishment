@@ -3041,6 +3041,102 @@ def render_master_page(user):
     st.stop()
 
 
+
+# ---------------------------------------------------------------------------
+# CONTROL PANEL MEMORY
+#
+# Every setting a planner changes is saved against their sign-in and restored
+# the next time they log in, so nobody re-types the same overrides every run.
+# Stored per user, never shared: one planner's overrides cannot silently
+# change another's run.
+#
+# STORAGE: same model as the credentials and store registry. Point
+# GCC_PREFS_FILE at persistent storage or the memory is lost on restart.
+# ---------------------------------------------------------------------------
+PREFS_FILE = os.environ.get("GCC_PREFS_FILE", ".prefs/panel.json")
+
+
+def _prefs_path():
+    q = os.path.abspath(PREFS_FILE)
+    os.makedirs(os.path.dirname(q), exist_ok=True)
+    return q
+
+
+def load_all_prefs():
+    try:
+        with open(_prefs_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def load_panel(email):
+    rec = load_all_prefs().get(str(email).strip().lower()) or {}
+    return rec.get("settings") or {}, rec.get("saved_at", "")
+
+
+def save_panel(email, settings):
+    try:
+        allp = load_all_prefs()
+        allp[str(email).strip().lower()] = {
+            "saved_at": time.strftime("%Y-%m-%d %H:%M"), "settings": settings}
+        with open(_prefs_path(), "w", encoding="utf-8") as fh:
+            json.dump(allp, fh, indent=1)
+        return True
+    except OSError:
+        return False
+
+
+def clear_panel(email):
+    try:
+        allp = load_all_prefs()
+        allp.pop(str(email).strip().lower(), None)
+        with open(_prefs_path(), "w", encoding="utf-8") as fh:
+            json.dump(allp, fh, indent=1)
+        return True
+    except OSError:
+        return False
+
+
+def P(name, default):
+    """A remembered setting, or the platform default if there is none."""
+    saved = st.session_state.get("panel_prefs") or {}
+    if name not in saved:
+        return default
+    v = saved[name]
+    try:                                    # keep the default's type
+        if isinstance(default, bool):
+            return bool(v)
+        if isinstance(default, int) and not isinstance(default, bool):
+            return int(v)
+        if isinstance(default, float):
+            return float(v)
+    except (TypeError, ValueError):
+        return default
+    return v
+
+
+def P_choice(name, default, options):
+    """A remembered choice, ignored if it is no longer a valid option."""
+    v = P(name, default)
+    return v if v in options else default
+
+
+def P_rows(name, default_df):
+    """A remembered table, ignored unless its columns still match."""
+    rows = (st.session_state.get("panel_prefs") or {}).get(name)
+    if not isinstance(rows, list) or not rows:
+        return default_df
+    try:
+        df = pd.DataFrame(rows)
+    except Exception:
+        return default_df
+    if set(df.columns) != set(default_df.columns) or len(df) != len(default_df):
+        return default_df
+    return df[list(default_df.columns)].reset_index(drop=True)
+
+
 def require_login():
     if not st.session_state.get("auth_user"):
         render_login()
@@ -3478,6 +3574,12 @@ CURRENT_USER = require_login()
 
 render_hero()
 
+# Restore this planner's own control panel from their last run.
+if "panel_prefs" not in st.session_state:
+    _saved, _saved_at = load_panel(CURRENT_USER)
+    st.session_state.panel_prefs = _saved
+    st.session_state.panel_saved_at = _saved_at
+
 st.session_state.setdefault("page", "run")
 STORE_REG = st.session_state.get("stores")
 if STORE_REG is None:
@@ -3552,11 +3654,35 @@ with st.container(border=True):
     st.markdown('<p class="sec-sub">Everything below has a working default. Touch it only '
                 'to override this run.</p>', unsafe_allow_html=True)
 
+    # ---- control panel memory ----------------------------------------------
+    if st.session_state.get("panel_prefs"):
+        _pm_l, _pm_r = st.columns([5, 1])
+        with _pm_l:
+            st.html(
+                f'<div class="who"><span class="who-dot"></span>'
+                f'Your settings from <b>'
+                f'{st.session_state.get("panel_saved_at") or "your last run"}</b> '
+                f'have been restored. Change anything below and the next run '
+                f'saves it again.</div>')
+        with _pm_r:
+            if st.button("Reset to defaults", use_container_width=True,
+                         help="Forget the saved settings and start from the "
+                              "platform defaults."):
+                clear_panel(CURRENT_USER)
+                for _k in ("panel_prefs", "panel_saved_at", "refill_mode",
+                           "run_type", "routing_df", "wh_registry",
+                           "band_editor", "thr_editor", "tgt_editor"):
+                    st.session_state.pop(_k, None)
+                for _k in [k for k in list(st.session_state) if k.startswith("wh_")]:
+                    st.session_state.pop(_k, None)
+                st.rerun()
+
     ribbon = st.empty()
 
     # ---- run type (replenishment / connection) -----------------------------
     st.html('<div class="grp">Run type</div>')
-    st.session_state.setdefault("run_type", DEFAULT_RUN_TYPE)
+    st.session_state.setdefault(
+        "run_type", P_choice("run_type", DEFAULT_RUN_TYPE, list(RUN_KEYS)))
 
     RUN_TABS = [
         (RUN_REPLENISHMENT, "Fashion Replenishment",
@@ -3587,9 +3713,11 @@ with st.container(border=True):
     run_type = st.session_state.run_type
 
     if run_type == RUN_CONNECTION:
+        _cm_opts = [CONN_ROUND_ROBIN, CONN_UPFRONT]
         conn_method = st.radio(
-            "How to share the stock", [CONN_ROUND_ROBIN, CONN_UPFRONT],
-            index=0, horizontal=False,
+            "How to share the stock", _cm_opts,
+            index=_cm_opts.index(P_choice("conn_method", CONN_ROUND_ROBIN, _cm_opts)),
+            horizontal=False,
             help="Round robin spreads one pack at a time so as many stores as "
                  "possible get the option. Upfront fills each store's whole target "
                  "in turn, so fewer stores get full depth.")
@@ -3633,7 +3761,8 @@ with st.container(border=True):
     st.html('<div class="grp">Refill form</div>')
 
     if "refill_mode" not in st.session_state:
-        st.session_state.refill_mode = DEFAULT_MODE
+        st.session_state.refill_mode = P_choice(
+            "refill_mode", DEFAULT_MODE, [MODE_PACK, MODE_LOOSE])
 
     FORM_TABS = [
         (MODE_PACK, "Pack", "whole packs &middot; size from Pack Ratio",
@@ -3678,7 +3807,7 @@ with st.container(border=True):
         st.html('<div class="grp">Target stock &mdash; weeks of cover</div>')
 
         ros_on = st.toggle(
-            "Adjust target stock by weeks of cover", value=ROS_ADJUST_ON,
+            "Adjust target stock by weeks of cover", value=P("ros_on", ROS_ADJUST_ON),
             help="Cover Weeks = (SOH + in-transit) / ROS / 7, where ROS is the store's own "
                  "rate. Cover is read against the country band below: too little "
                  "raises the target, too much cuts it, far too much stops the line.")
@@ -3691,6 +3820,7 @@ with st.container(border=True):
                  "Increase Up To (wks)": v[0], "Decrease From (wks)": v[1],
                  "Stop From (wks)": v[2], "Increase %": v[3], "Decrease %": v[4]}
                 for c, v in COVER_BANDS.items()]).sort_values("Country").reset_index(drop=True)
+            band_df = P_rows("cover_bands", band_df)
             if ros_on:
                 band_edit = st.data_editor(
                     band_df, key="band_editor", hide_index=True, use_container_width=True,
@@ -3757,17 +3887,18 @@ with st.container(border=True):
             if ros_on:
                 ros_min_days = st.number_input(
                     "Rate trustable from (trading days)", 0, 365,
-                    int(DEFAULT_ROS_MIN_DAYS), 1,
+                    int(P("ros_min_days", DEFAULT_ROS_MIN_DAYS)), 1,
                     help="Below this a store has too little history for its rate to mean "
                          "anything. The target is used exactly as supplied.")
                 ros_max_days = st.number_input(
                     "Rate trustable up to (trading days)", 1, 3650,
-                    int(DEFAULT_ROS_MAX_DAYS), 5,
+                    int(P("ros_max_days", DEFAULT_ROS_MAX_DAYS)), 5,
                     help="Above this a lifetime average no longer describes how the option "
                          "is selling now, so the target is left alone.")
                 min_ros = st.number_input(
                     "Minimum rate of sale (units/day) to replenish at all",
-                    min_value=0.0, max_value=5.0, value=float(DEFAULT_MIN_ROS),
+                    min_value=0.0, max_value=5.0,
+                    value=float(P("min_ros", DEFAULT_MIN_ROS)),
                     step=0.01, format="%.2f",
                     help="Lines selling slower than this are excluded entirely. "
                          "0 disables it.")
@@ -3829,10 +3960,14 @@ with st.container(border=True):
 
     # ---- warehouse network (editable) --------------------------------------
     if "wh_registry" not in st.session_state:
-        st.session_state.wh_registry = dict(GRID_WH)
+        _saved_reg = (st.session_state.get("panel_prefs") or {}).get("wh_registry")
+        st.session_state.wh_registry = (dict(_saved_reg)
+                                        if isinstance(_saved_reg, dict) and _saved_reg
+                                        else dict(GRID_WH))
     if "routing_df" not in st.session_state:
-        st.session_state.routing_df = pd.DataFrame(
+        _default_routing = pd.DataFrame(
             routing_rows_from(COUNTRY_PRIORITY, sorted(COUNTRY_PRIORITY)))
+        st.session_state.routing_df = P_rows("routing", _default_routing)
 
     reg = st.session_state.wh_registry
     accent = {c: WH_PALETTE[i % len(WH_PALETTE)] for i, c in enumerate(reg)}
@@ -3852,7 +3987,7 @@ with st.container(border=True):
                     if v == 1:
                         primary.append(r["Country"])
         with col:
-            on = st.checkbox(name, value=True, key=f"wh_{code}")
+            on = st.checkbox(name, value=P(f"wh_{code}", True), key=f"wh_{code}")
             st.html(f"""
             <div class="node {'' if on else 'off'}" style="--nc:{accent[code]}">
               <div class="node-code">{code}</div>
@@ -3966,7 +4101,7 @@ with st.container(border=True):
             reserve_choice = st.radio(
                 f"Reserve inventory from {reg.get(RESERVE_WH_CODE, RESERVE_WH_CODE)}?",
                 options=["Yes", "No"],
-                index=0 if DEFAULT_RESERVE_ON else 1,
+                index=0 if P("reserve_on", DEFAULT_RESERVE_ON) else 1,
                 horizontal=True,
                 help="Held back from the working pool and never released during a run. "
                      "It stays in the warehouse and returns in tomorrow's WMS snapshot.",
@@ -3974,7 +4109,8 @@ with st.container(border=True):
             reserve_on = reserve_choice == "Yes"
             if reserve_on:
                 reserve_pct = st.slider("Reserve %", min_value=0, max_value=50,
-                                        value=DEFAULT_RESERVE_PCT, step=1,
+                                        value=int(P("reserve_pct", DEFAULT_RESERVE_PCT)),
+                                        step=1,
                                         format="%d%%", label_visibility="collapsed")
             else:
                 reserve_pct = 0
@@ -4027,11 +4163,13 @@ with st.container(border=True):
 
         with c_left:
             st.html('<div class="grp">Pack rounding</div>')
-            customise = st.toggle("Override thresholds", value=False,
+            customise = st.toggle("Override thresholds",
+                                  value=P("thresholds_on", False),
                                   help="A remainder at or above the cut rounds up to a full pack.")
             grid_df = pd.DataFrame([{"Country": c, "Threshold %": p}
                                     for c, p in DEFAULT_PACK_THRESHOLD_PCT.items()]
                                    ).sort_values("Country").reset_index(drop=True)
+            grid_df = P_rows("thresholds", grid_df)
             if customise:
                 edited = st.data_editor(
                     grid_df, key="thr_editor", hide_index=True, use_container_width=True,
@@ -4065,11 +4203,13 @@ with st.container(border=True):
 
         with c_right:
             st.html('<div class="grp">Default target stock</div>')
-            tgt_customise = st.toggle("Override targets", value=False,
+            tgt_customise = st.toggle("Override targets",
+                                      value=P("targets_on", False),
                                       help="Used when an Option + Store has no row in DEPTH.")
             tgt_df = pd.DataFrame([{"Country": c, "Default Target Stock": v}
                                    for c, v in DEFAULT_TARGET_STOCK.items()]
                                   ).sort_values("Country").reset_index(drop=True)
+            tgt_df = P_rows("targets", tgt_df)
             if tgt_customise:
                 tgt_edited = st.data_editor(
                     tgt_df, key="tgt_editor", hide_index=True, use_container_width=True,
@@ -4181,7 +4321,8 @@ with st.container(border=True):
             with sd_l:
                 sale_days = st.number_input(
                     "How many days of sales does this SALE file cover?",
-                    min_value=1, max_value=730, value=int(DEFAULT_SALE_DAYS), step=1,
+                    min_value=1, max_value=730,
+                    value=int(P("sale_days", DEFAULT_SALE_DAYS)), step=1,
                     help="The rate of sale is this file's quantity divided by the "
                          "number of days it covers - or by the days the store has "
                          "actually traded the option, whichever is fewer.")
@@ -4224,6 +4365,38 @@ with st.container(border=True):
                     ros_on, min_ros, cover_bands, ros_min_days, ros_max_days,
                     run_type, conn_method, ALLOWED_STORES, CONSOLIDATE_ON,
                     sale_days, progress_cb)
+
+                # Remember this panel for the next time this planner signs in.
+                _panel = {
+                    "run_type": run_type,
+                    "refill_mode": refill_mode,
+                    "conn_method": conn_method,
+                    "ros_on": bool(ros_on),
+                    "min_ros": float(min_ros),
+                    "ros_min_days": int(ros_min_days),
+                    "ros_max_days": int(ros_max_days),
+                    "reserve_on": bool(reserve_on),
+                    "reserve_pct": int(reserve_pct),
+                    "thresholds_on": bool(customise),
+                    "targets_on": bool(tgt_customise),
+                    "thresholds": [{"Country": c, "Threshold %": v}
+                                   for c, v in pack_thresholds.items()],
+                    "targets": [{"Country": c, "Default Target Stock": v}
+                                for c, v in default_targets.items()],
+                    "cover_bands": [
+                        {"Country": c, "Increase Up To (wks)": v[0],
+                         "Decrease From (wks)": v[1], "Stop From (wks)": v[2],
+                         "Increase %": v[3], "Decrease %": v[4]}
+                        for c, v in (cover_bands or COVER_BANDS).items()],
+                    "routing": st.session_state.routing_df.to_dict("records"),
+                    "wh_registry": dict(st.session_state.wh_registry),
+                    "sale_days": int(sale_days) if sale_days else None,
+                }
+                _panel.update({f"wh_{c}": (c in set(active_wh))
+                               for c in st.session_state.wh_registry})
+                st.session_state.panel_prefs = _panel
+                if save_panel(CURRENT_USER, _panel):
+                    st.session_state.panel_saved_at = time.strftime("%Y-%m-%d %H:%M")
 
                 st.session_state.final = final
                 st.session_state.detail = detail
