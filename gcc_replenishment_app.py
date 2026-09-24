@@ -1410,7 +1410,8 @@ def build_universe(sales, depth, soh_ag, in_transit, country_map,
     return u, n_defaulted, n_slow
 
 
-def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None):
+def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None,
+             wh_transit=None):
     """
     Rank every store by Total Sold Qty (highest first) within its Option, then
     walk that Option's country priority chain and take the full need from the
@@ -1422,9 +1423,13 @@ def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None)
               ratio in build_universe, so it is taken as-is.
       Loose - individual barcodes, ships in eaches, no pack rounding.
 
-    Within the chosen form each warehouse has two buckets, drawn own stock
-    first and then inbound in-transit, so the audit trail can say which one
-    paid for the line.
+    A warehouse can only ship what is ON ITS SHELF. Stock already travelling
+    between two warehouses is NOT treated as available there. Instead, before
+    falling back to a backup warehouse, whatever that backup is already sending
+    to the warehouse ahead of it in the chain is NETTED against the line - that
+    quantity is already on its way to serve this market, so raising a second
+    transfer for it would ship the same demand twice. This is the same rule
+    the Basics module uses.
     """
     form_code = "P" if mode == MODE_PACK else "L"
     form_name = "Pack" if mode == MODE_PACK else "Loose"
@@ -1434,8 +1439,12 @@ def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None)
     keys = list(zip(wms_ag["Option"].to_numpy(), wms_ag["WH"].to_numpy(),
                     wms_ag["Mode"].to_numpy()))
     pool_own = dict(zip(keys, wms_ag["Pool Own"].to_numpy().astype(int)))
-    pool_inb = dict(zip(keys, wms_ag["Pool Inbound"].to_numpy().astype(int)))
     inb_from = dict(zip(keys, wms_ag["Inbound From"].to_numpy()))
+    # (fromWH, toWH, option) -> units already moving, consumed as it is netted
+    netting = {}
+    for (a, b, o), q in dict(wh_transit or {}).items():
+        k = (str(a).strip().upper(), str(b).strip().upper(), str(o).strip().upper())
+        netting[k] = netting.get(k, 0.0) + float(q)
     item_key = dict(zip(keys, wms_ag["Item Key"].to_numpy()))
     ratios = dict(zip(keys, wms_ag["Pack Ratio"].to_numpy().astype(int)))
 
@@ -1449,7 +1458,7 @@ def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None)
     n = len(u)
     alloc = np.zeros(n, dtype=np.int64)
     from_own = np.zeros(n, dtype=np.int64)
-    from_inb = np.zeros(n, dtype=np.int64)
+    netted = np.zeros(n, dtype=np.int64)
     npacks = np.zeros(n, dtype=np.int64)
     pratio = np.zeros(n, dtype=np.int64)
     source = np.empty(n, dtype=object)
@@ -1469,41 +1478,47 @@ def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None)
             continue
 
         placed = False
+        net_here = 0
         for rank, wh in enumerate(chain, start=1):
+            # Before a backup warehouse is used, count what it is already
+            # sending to the warehouse ahead of it in the chain.
+            if rank > 1 and need > 0:
+                nk = (str(wh).upper(), str(chain[rank - 2]).upper(),
+                      str(options[i]).upper())
+                avail = netting.get(nk, 0.0)
+                take = int(min(need, avail))
+                if take > 0:
+                    netting[nk] = avail - take
+                    need -= take
+                    net_here += take
+                if need <= 0:
+                    break
+
             key = (options[i], wh, form_code)
             own = pool_own.get(key, 0)
-            inb = pool_inb.get(key, 0)
-            if own + inb < need:
+            if own < need:
                 continue
 
-            take_own = min(own, need)
-            take_inb = need - take_own
-            if take_own:
-                pool_own[key] = own - take_own
-            if take_inb:
-                pool_inb[key] = inb - take_inb
+            take_own = need
+            pool_own[key] = own - take_own
 
             ratio = max(1, int(ratios.get(key, FALLBACK_PACK_SIZE))) if form_code == "P" else 1
             alloc[i] = need
             from_own[i] = take_own
-            from_inb[i] = take_inb
+            netted[i] = net_here
             pratio[i] = ratio if form_code == "P" else 0
             npacks[i] = need // ratio if form_code == "P" else 0
             source[i] = wh
             bkey[i] = item_key.get(key, "")
 
             whn = names.get(wh, wh)
-            src = inb_from.get(key) or "another warehouse"
             tag = f"P{rank}"
             qdesc = (f"{npacks[i]} pack(s) of {ratio} ({need} units)"
                      if form_code == "P" else f"{need} loose units")
-            if take_inb == 0:
-                bucket = f"{whn} WMS inventory alone"
-            elif take_own == 0:
-                bucket = f"in-transit inbound from {src} ({whn} had no own stock)"
-            else:
-                bucket = (f"{take_own} from {whn} WMS inventory + {take_inb} "
-                          f"from in-transit inbound from {src}")
+            bucket = f"{whn} shelf stock"
+            if net_here:
+                bucket += (f", after {net_here} unit(s) already in transit toward "
+                           f"{names.get(chain[0], chain[0])} were netted off")
 
             if rank == 1:
                 status[i] = f"Filled {tag} - {form_name.lower()}"
@@ -1518,14 +1533,23 @@ def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None)
 
         if not placed:
             source[i] = ""; bkey[i] = ""
-            status[i] = "Unfilled - no eligible warehouse had stock"
+            netted[i] = net_here
             chain_names = " > ".join(names.get(w, w) for w in chain)
-            remark[i] = (f"No {form_name.lower()} stock (own or inbound) at any "
-                         f"eligible warehouse: {chain_names}")
+            if need <= 0 and net_here:
+                status[i] = "Covered by stock already in transit"
+                remark[i] = (f"No transfer raised: {net_here} unit(s) are already "
+                             f"travelling toward {names.get(chain[0], chain[0])} and "
+                             f"cover this line.")
+            else:
+                status[i] = "Unfilled - no eligible warehouse had stock"
+                remark[i] = (f"No {form_name.lower()} shelf stock at any eligible "
+                             f"warehouse: {chain_names}"
+                             + (f" ({net_here} unit(s) netted off as already in "
+                                f"transit)" if net_here else ""))
 
     u["Allocated Qty"] = alloc
     u["Qty from Own Stock"] = from_own
-    u["Qty from In-Transit"] = from_inb
+    u["Qty Netted (in transit)"] = netted
     u["Refill Form"] = np.where(alloc > 0, form_name, "")
     u["Item Key"] = bkey
     u["Pack Ratio Used"] = pratio
@@ -1534,7 +1558,7 @@ def allocate(u, wms_ag, mode=DEFAULT_MODE, country_priority=None, wh_names=None)
     u["Source WH"] = pd.Series(source, index=u.index).map(names).fillna("")
     u["Fulfilment Status"] = status
     u["Source Remark"] = remark
-    return u, pool_own, pool_inb
+    return u, pool_own, netting
 
 
 
@@ -2023,6 +2047,8 @@ def allocate_connection(u, wms_ag, method=DEFAULT_CONN_METHOD, mode=DEFAULT_MODE
     keys = list(zip(wms_ag["Option"].to_numpy(), wms_ag["WH"].to_numpy(),
                     wms_ag["Mode"].to_numpy()))
     pool_own = dict(zip(keys, wms_ag["Pool Own"].to_numpy().astype(int)))
+    # A first placement may draw on stock already inbound to the warehouse:
+    # the store holds none of the option, so there is nothing to net against.
     pool_inb = dict(zip(keys, wms_ag["Pool Inbound"].to_numpy().astype(int)))
     inb_from = dict(zip(keys, wms_ag["Inbound From"].to_numpy()))
     item_key = dict(zip(keys, wms_ag["Item Key"].to_numpy()))
@@ -2237,6 +2263,12 @@ def run_engine(frames, active_wh, pack_thresholds=None, default_targets=None,
      pack_size_map, ros_tbl, scope_basis, wh_transit_map, warns) = prepare(
          frames, active_wh, reserve_map, wh_names, allowed, sale_days)
 
+    # Fashion and Basics ship only what is on the shelf; stock in transit
+    # between warehouses is netted, never shipped. The reported pool must say
+    # the same, or utilisation is measured against stock that cannot move.
+    if run_type in (RUN_REPLENISHMENT, RUN_BASICS):
+        wms_ag["Working Pool"] = wms_ag["Pool Own"]
+
     if run_type == RUN_BASICS:
         report(0.35, "Grouping stock by category and colour")
         soh_raw = frames["SOH"]
@@ -2331,7 +2363,8 @@ def run_engine(frames, active_wh, pack_thresholds=None, default_targets=None,
                 f"minimum rate of sale ({min_ros:g}/day).")
 
         report(0.60, f"Allocating across warehouses - {u['Option'].nunique():,} options")
-        detail, pool_own, pool_inb = allocate(u, wms_ag, mode, country_priority, wh_names)
+        detail, pool_own, pool_inb = allocate(u, wms_ag, mode, country_priority,
+                                              wh_names, wh_transit_map)
 
     # Descriptive lookups for the output and audit trail
     detail = (detail.merge(store_names, on="Store", how="left")
@@ -2401,13 +2434,16 @@ def run_engine(frames, active_wh, pack_thresholds=None, default_targets=None,
     ).round(1)
     shipped_own = (detail.groupby("Source WH Code")["Qty from Own Stock"].sum()
                    if len(detail) else pd.Series(dtype=float))
-    shipped_inb = (detail.groupby("Source WH Code")["Qty from In-Transit"].sum()
-                   if len(detail) else pd.Series(dtype=float))
+    _net_col = ("Qty Netted (in transit)" if "Qty Netted (in transit)" in detail.columns
+                else "Qty from In-Transit")
+    shipped_inb = (detail.groupby("Source WH Code")[_net_col].sum()
+                   if len(detail) and _net_col in detail.columns
+                   else pd.Series(dtype=float))
     wh_summary["Shipped from Own"] = wh_summary["WH"].map(shipped_own).fillna(0).astype(int)
-    wh_summary["Shipped from In-Transit"] = wh_summary["WH"].map(shipped_inb).fillna(0).astype(int)
+    wh_summary["Netted from In-Transit"] = wh_summary["WH"].map(shipped_inb).fillna(0).astype(int)
     wh_summary = wh_summary[["WH", "WH Name", "Own Stock", "Inbound In-Transit", "Opening",
                              "Reserve %", "Reserve Held", "Working Pool", "Shipped",
-                             "Shipped from Own", "Shipped from In-Transit",
+                             "Shipped from Own", "Netted from In-Transit",
                              "Unused Pool", "Pool Utilisation %"]]
 
     # Release the big intermediates before returning. On a 1 GB container the
